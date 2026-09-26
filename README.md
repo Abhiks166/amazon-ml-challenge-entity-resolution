@@ -22,3 +22,28 @@ A high-performance, out-of-core Entity Resolution (Record Linkage) system design
 - `fast_inference.py` / `scalable_inference.py`: Runs multi-pass SNM candidate blocking and streams chunk files to parallel workers.
 - `export_submission.py`: Assembles scored Parquet result chunks from disk, applies probability capping (Top 6 per entity), and exports `submission.tsv`.
 - `features.py` / `utils.py`: High-performance feature extraction routines.
+
+
+How it works
+
+[ Raw TSV Datasets ] 
+         │
+         ▼
+Stage 1: Multi-Pass Bucketed SNM Blocking (DuckDB)
+         ├── Pass 1: Clean Name Bucketing
+         ├── Pass 2: Token-Sorted Name Bucketing
+         └── Pass 3: Clean Address Bucketing
+         │
+         ▼ (Generates ~14k Parquet Candidate Chunks on Disk)
+Stage 2: Parallel Scoring Engine (4 Worker Processes)
+         ├── Read 10,000-row Parquet chunk
+         ├── Extract 10 String-Distance Features (rapidfuzz)
+         ├── Score via LightGBM matcher model
+         └── Save Result Parquet chunk to disk
+         │
+         ▼ (Reads Scored Results from Disk)
+Stage 3: Disk-Backed Aggregation & Capping (DuckDB)
+         ├── Rank S2 predictions (Top-5 prob cap)
+         ├── Rank S3 predictions (Top-6 prob cap)
+         ├── Global Merge & Top-6 Rank Filter
+         └── Export Final submission.tsv
