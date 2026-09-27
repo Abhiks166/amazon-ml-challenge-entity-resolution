@@ -184,34 +184,41 @@ def measure_candidates(
     eligible_s1: str = "train_s1",
     baseline: str | None = None,
 ) -> dict[str, float | int]:
-    """Report recall and actual, deduplicated candidate-pair distribution."""
-    metrics = con.execute(f"""
-        WITH true_pairs AS (
-            SELECT s1_id, source_id
-            FROM ground_truth_pairs
-            WHERE source_id LIKE '{source_prefix}%'
-        ),
-        per_s1 AS (
-            SELECT s1_id, COUNT(*) AS candidates
-            FROM {candidates}
-            GROUP BY s1_id
-        )
-        SELECT
-            (SELECT COUNT(*) FROM true_pairs),
-            (SELECT COUNT(*) FROM true_pairs gt JOIN {candidates} c
-                ON c.s1_id = gt.s1_id AND c.source_id = gt.source_id),
-            (SELECT COUNT(*) FROM {candidates}),
-            (SELECT AVG(candidates) FROM per_s1),
-            (SELECT quantile_cont(candidates, 0.50) FROM per_s1),
-            (SELECT quantile_cont(candidates, 0.90) FROM per_s1),
-            (SELECT quantile_cont(candidates, 0.95) FROM per_s1),
-            (SELECT quantile_cont(candidates, 0.99) FROM per_s1),
-            (SELECT MAX(candidates) FROM per_s1),
-            (SELECT COUNT(*) FROM {eligible_s1} s LEFT JOIN per_s1 p ON p.s1_id = s.entity_id
-                WHERE p.s1_id IS NULL),
-            (SELECT COUNT(*) FROM per_s1 WHERE candidates > {LARGE_CANDIDATE_SET});
+    """Report candidate metrics with one reusable per-S1 aggregate table."""
+    candidate_counts = f"metric_counts_{candidates}"
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE {candidate_counts} AS
+        SELECT s1_id, COUNT(*) AS candidates
+        FROM {candidates}
+        GROUP BY s1_id;
+    """)
+
+    # Each query below has one purpose. In particular, candidate_counts is
+    # computed once and replaces the previous repeated per_s1 CTE scans.
+    volume = con.execute(f"SELECT COUNT(*) FROM {candidates};").fetchone()[0]
+    total, recovered = con.execute(f"""
+        SELECT COUNT(*) AS total_pairs, COUNT(c.s1_id) AS recovered_pairs
+        FROM ground_truth_pairs gt
+        LEFT JOIN {candidates} c
+          ON c.s1_id = gt.s1_id
+         AND c.source_id = gt.source_id
+        WHERE gt.source_id LIKE '{source_prefix}%';
     """).fetchone()
-    total, recovered, volume, mean, median, p90, p95, p99, maximum, zero, large = metrics
+    mean, median, p90, p95, p99, maximum, s1_with_candidates, large = con.execute(f"""
+        SELECT
+            AVG(candidates),
+            quantile_cont(candidates, 0.50),
+            quantile_cont(candidates, 0.90),
+            quantile_cont(candidates, 0.95),
+            quantile_cont(candidates, 0.99),
+            MAX(candidates),
+            COUNT(*),
+            COUNT(*) FILTER (WHERE candidates > {LARGE_CANDIDATE_SET})
+        FROM {candidate_counts};
+    """).fetchone()
+    eligible_count = con.execute(f"SELECT COUNT(*) FROM {eligible_s1};").fetchone()[0]
+    zero = eligible_count - s1_with_candidates
+
     additional = 0
     if baseline is not None:
         additional = con.execute(f"""
@@ -221,6 +228,8 @@ def measure_candidates(
             LEFT JOIN {baseline} b ON b.s1_id = gt.s1_id AND b.source_id = gt.source_id
             WHERE gt.source_id LIKE '{source_prefix}%' AND b.s1_id IS NULL;
         """).fetchone()[0]
+
+    con.execute(f"DROP TABLE {candidate_counts};")
     elapsed = time.perf_counter() - started_at
     recall = recovered / total if total else 0.0
     result = {
@@ -318,7 +327,10 @@ def run_source(con: duckdb.DuckDBPyConnection, source_name: str, source_table: s
     print(f"\n=== S1 -> {source_name.upper()} ===")
     started = time.perf_counter()
     baseline = build_baseline_candidates(con, source_name, source_table)
+    print(f"  baseline candidate construction: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
     results = [measure_candidates(con, "A current four-pass baseline", baseline, prefix, started)]
+    print(f"  baseline metric measurement: {results[0]['runtime']:.1f}s")
 
     started = time.perf_counter()
     create_char_index(con, source_table, "source_char_index")
