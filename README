@@ -1,0 +1,140 @@
+# Entity Resolution Pipeline — Amazon ML Challenge
+
+A scalable, memory-safe, out-of-core Entity Resolution (ER) pipeline built to match business entities across independent data sources (S1, S2, S3) while optimizing for the precision-heavy F_0.5 metric.
+
+---
+
+## 📌 Executive Summary & Pipeline Overview
+
+This solution processes over 1.7M reference entities (S1) and multi-million record candidate catalogs (S2, S3). To handle this scale without exceeding host memory or hitting thread collisions under Windows execution limits, the architecture separates **Candidate Generation (Blocking)** from **Parallel Feature Engineering & Scoring**.
+
+### Core Architecture Stages
+
+1. **Multi-Pass Sorted Neighborhood Method (SNM) Blocking:** Executes blocking via DuckDB in out-of-core SQL passes across key attributes (`name`, `token_sorted`, `address`). Candidates are strictly partitioned by country and capped per pass to maximize recall while maintaining low candidate volume.
+2. **Chunked Parquet Partitioning:** Candidate pairs are streamed out into fixed-size Parquet chunk files (~10,000 pairs per chunk) to eliminate memory spikes.
+3. **21-Feature Vector Engineering & LightGBM Scoring:** Worker processes run in parallel, computing string edit distance, token Jaccard, TF-IDF cosine similarity, character n-gram, and country-matching features before predicting match probabilities using trained LightGBM boosters (`matcher_s2_model.txt`, `matcher_s3_model.txt`).
+4. **Out-of-Core Aggregation & Export:** Reads scored results out-of-core via DuckDB, applies global probability ranking caps per entity, and generates the exact required submission outputs (`output/matching_results.tsv` and `output/candidate_pairs.tsv`).
+
+---
+
+## 📁 Repository & Project Structure
+
+To adhere to the submission specification, the directory structure is organized as follows:
+
+```text
+code/business_entity_resolution/
+├── README.md                   # Complete instructions for pipeline reproduction
+├── requirements.txt            # Pinned environment dependencies
+└── src/
+    ├── fast_inference.py       # Main end-to-end blocking & scoring pipeline script
+    ├── export_submission.py    # Out-of-core aggregation & TSV file generator
+    ├── features.py             # 21-feature vector computation module
+    ├── train_model.py          # LightGBM booster training script
+    ├── matcher_s2_model.txt    # Trained LightGBM weights for Source 2
+    └── matcher_s3_model.txt    # Trained LightGBM weights for Source 3
+
+
+
+Requirements & Environment Setup
+Prerequisites
+Python: 3.10 or higher (Tested on Python 3.13)
+
+OS: Windows / Linux / macOS
+
+System Memory: Minimum 16 GB RAM recommended
+cd code/business_entity_resolution
+Windows :
+python -m venv .venv
+.venv\Scripts\activate
+MAc OS:
+python3 -m venv .venv
+source .venv/bin/activate
+
+Installeed Dependencies:
+pip install --upgrade pip
+pip install -r requirements.txt
+
+
+
+End-to-End Execution Guide
+Follow these sequential steps to reproduce model training, run fast inference, and export valid submission artifacts from raw test data.
+
+Step 1: Data Placement
+Ensure input datasets are placed in the expected dataset/ path relative to your execution directory:
+
+Plaintext
+dataset/
+├── train/
+│   ├── train_source1.tsv
+│   ├── train_source2.tsv
+│   ├── train_source3.tsv
+│   └── train_ground_truth.tsv
+└── test/
+    ├── test_source1.tsv
+    ├── test_source2.tsv
+    └── test_source3.tsv
+Step 2: (Optional) Model Training
+If you wish to retrain the LightGBM models from training data and regenerate model weight artifacts (matcher_s2_model.txt and matcher_s3_model.txt), run:
+
+Bash
+python src/train_model.py
+This extracts training candidate pairs, builds 21-feature vectors against train_ground_truth.tsv, and saves optimized LightGBM model text files into src/.
+
+Step 3: Fast Inference & Blocking Candidate Generation
+To execute blocking, chunk candidate export, feature engineering, and model inference across test catalogs:
+
+Bash
+python src/fast_inference.py
+What happens during fast_inference.py:
+Environment Safety: C caps OpenBLAS, MKL, and Polars threads (OPENBLAS_NUM_THREADS=1, POLARS_MAX_THREADS=1) to eliminate background thread memory collisions on Windows.
+
+Out-of-Core Blocking: Executes Multi-Pass SNM in DuckDB on test_source1.tsv vs test_source2.tsv / test_source3.tsv across name, token_sorted, and address passes.
+
+Chunk Export: Candidate pairs are partitioned into lightweight .parquet chunks inside work/candidates_s2/ and work/candidates_s3/.
+
+Parallel Scoring: Worker processes compute 21 features per pair and write predicted probabilities into work/results_s2/ and work/results_s3/.
+
+Step 4: Out-of-Core Output Export & Verification
+Once scoring completes, generate and validate the required submission files:
+
+Bash
+python src/export_submission.py
+Output Generation Details:
+output/matching_results.tsv: Ranks predicted candidates per S1 entity across S2 and S3, applies probability thresholding (>= 0.50), caps maximum matches per entity, and formats matches as comma-separated ID strings. Singletons (entities with no matches) are correctly preserved with empty match strings.
+
+output/candidate_pairs.tsv: Exports comma-separated candidate entity IDs for every S1 record directly from the blocking stage, ensuring every match in matching_results.tsv is a subset of candidate_pairs.tsv.
+
+Step 5: Submission Validation
+Run the provided verification script from the root directory to confirm strict compliance with submission formatting rules:
+
+Bash
+python3 utils/validate_submission.py \
+    --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv \
+    --test-dir dataset/test
+
+Methodology Highlights
+1. Blocking & Candidate Generation (SNM)
+Attribute Cleaning: Removes non-alphanumeric noise, lowercases, and trims white space inside DuckDB SQL.
+
+Country Partitioning: Entities are blocked strictly within matching country labels (handling US, India, and unseen open-set countries like France).
+
+Multi-Pass Strategy: Combines normalized exact name keys, token-alphabetized keys (to catch word transpositions like "Amazon India Pvt Ltd" vs "India Amazon Pvt Ltd"), and normalized address strings.
+
+2. Feature Engineering (21 Features)
+Features are computed dynamically per candidate pair in features.py:
+
+Name Features: Exact equality, token Jaccard similarity, Levenshtein ratio, prefix/suffix overlap, character 3-gram cosine similarity.
+
+Address Features: Digit sequence match ratio, street/city token overlap, address Jaccard, string edit distance.
+
+Source & Global Meta Features: One-hot source catalog indicators (S2 vs S3) and country compatibility indicators.
+
+3. Precision Optimization (F_0.5)
+Since F_0.5 penalizes False Positives twice as heavily as False Negatives:
+
+The scoring classification threshold is tuned to 0.50.
+
+Post-processing probability ranking caps maximum predictions per S1 entity (Top-5 for S2, Top-6 for S3, Top-6 combined).
+
+Singletons receive explicit handling to guarantee credit for correct empty predictions.
