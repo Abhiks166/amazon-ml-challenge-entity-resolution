@@ -65,11 +65,14 @@ def bucket_pair_sql(ranked_table: str) -> str:
 def build_baseline_candidates(con: duckdb.DuckDBPyConnection, source_name: str, source_table: str) -> str:
     """Materialize the exact four current passes, except intentionally pre-cap."""
     parts = []
+    ranked_tables = []
     for pass_name, config in ALL_PASSES.items():
         ranked = create_ranked_records(con, source_table, source_name, pass_name, config["window"])
+        ranked_tables.append(ranked)
         parts.append(bucket_pair_sql(ranked))
     table = f"baseline_{source_name}"
     con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT DISTINCT * FROM ({' UNION ALL '.join(parts)});")
+    con.execute("DROP TABLE " + ", ".join(ranked_tables) + ";")
     return table
 
 
@@ -97,21 +100,27 @@ def create_number_index(con: duckdb.DuckDBPyConnection, table: str, index_table:
     """)
 
 
-def print_frequency_distribution(con: duckdb.DuckDBPyConnection, source_index: str, label: str, threshold: int) -> None:
-    """Report posting-list sizes before creating a candidate-pair join."""
+def create_posting_frequency(con: duckdb.DuckDBPyConnection, source_index: str, table: str) -> str:
+    """Materialize source posting counts once for reuse by all strategies."""
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE {table} AS
+        SELECT country, block_key, COUNT(*) AS postings
+        FROM {source_index}
+        GROUP BY country, block_key;
+    """)
+    return table
+
+
+def print_frequency_distribution(con: duckdb.DuckDBPyConnection, frequency_table: str, label: str, threshold: int) -> None:
+    """Report posting-list sizes from the already-materialized frequency table."""
     row = con.execute(f"""
-        WITH frequencies AS (
-            SELECT country, block_key, COUNT(*) AS postings
-            FROM {source_index}
-            GROUP BY country, block_key
-        )
         SELECT
             COUNT(*),
             quantile_cont(postings, 0.50), quantile_cont(postings, 0.90),
             quantile_cont(postings, 0.95), quantile_cont(postings, 0.99), MAX(postings),
             COUNT(*) FILTER (WHERE postings > {threshold}),
             SUM(postings) FILTER (WHERE postings > {threshold})
-        FROM frequencies;
+        FROM {frequency_table};
     """).fetchone()
     keys, p50, p90, p95, p99, maximum, over, rows_over = row
     print(
@@ -121,34 +130,48 @@ def print_frequency_distribution(con: duckdb.DuckDBPyConnection, source_index: s
     )
 
 
+def index_candidate_sql(
+    s1_index: str,
+    source_index: str,
+    source_frequency: str,
+    max_source_postings: int | None,
+    restrict_s1: str | None = None,
+) -> str:
+    """Return the real, deduplicated posting-list candidate relation."""
+    filter_sql = ""
+    if max_source_postings is not None:
+        filter_sql = f"WHERE source_frequency.postings <= {max_source_postings}"
+    restrict_join = ""
+    if restrict_s1 is not None:
+        restrict_join = f"JOIN {restrict_s1} eligible ON eligible.entity_id = s1.entity_id"
+    return f"""
+        SELECT DISTINCT s1.entity_id AS s1_id, source.entity_id AS source_id
+        FROM {s1_index} s1
+        {restrict_join}
+        JOIN {source_index} source
+          ON s1.country = source.country
+         AND s1.block_key = source.block_key
+        JOIN {source_frequency}
+          ON source_frequency.country = source.country
+         AND source_frequency.block_key = source.block_key
+        {filter_sql}
+    """
+
+
 def build_index_candidates(
     con: duckdb.DuckDBPyConnection,
     s1_index: str,
     source_index: str,
+    source_frequency: str,
     table: str,
     max_source_postings: int | None,
+    restrict_s1: str | None = None,
 ) -> str:
     """Materialize actual unique pairs from a same-country inverted index."""
-    filter_sql = ""
-    if max_source_postings is not None:
-        filter_sql = f"WHERE source_frequency.postings <= {max_source_postings}"
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE {table} AS
-        WITH source_frequency AS (
-            SELECT country, block_key, COUNT(*) AS postings
-            FROM {source_index}
-            GROUP BY country, block_key
-        )
-        SELECT DISTINCT s1.entity_id AS s1_id, source.entity_id AS source_id
-        FROM {s1_index} s1
-        JOIN {source_index} source
-          ON s1.country = source.country
-         AND s1.block_key = source.block_key
-        JOIN source_frequency
-          ON source_frequency.country = source.country
-         AND source_frequency.block_key = source.block_key
-        {filter_sql};
-    """)
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE {table} AS "
+        f"{index_candidate_sql(s1_index, source_index, source_frequency, max_source_postings, restrict_s1)};"
+    )
     return table
 
 
@@ -215,6 +238,71 @@ def measure_candidates(
     return result
 
 
+def measure_index_join(
+    con: duckdb.DuckDBPyConnection,
+    label: str,
+    s1_index: str,
+    source_index: str,
+    source_frequency: str,
+    source_prefix: str,
+    started_at: float,
+    max_source_postings: int | None,
+) -> dict[str, float | int]:
+    """Measure a naive posting join without retaining a candidate table.
+
+    DISTINCT remains essential: a pair that shares several block keys is one
+    candidate, exactly as in the materialized experiment. DuckDB may spill the
+    materialized CTE while deduplicating, but the relation is discarded as soon
+    as these metrics have been aggregated.
+    """
+    candidate_sql = index_candidate_sql(
+        s1_index, source_index, source_frequency, max_source_postings
+    )
+    metrics = con.execute(f"""
+        WITH candidate_pairs AS MATERIALIZED ({candidate_sql}),
+        true_pairs AS MATERIALIZED (
+            SELECT s1_id, source_id
+            FROM ground_truth_pairs
+            WHERE source_id LIKE '{source_prefix}%'
+        ),
+        per_s1 AS MATERIALIZED (
+            SELECT s1_id, COUNT(*) AS candidates
+            FROM candidate_pairs
+            GROUP BY s1_id
+        )
+        SELECT
+            (SELECT COUNT(*) FROM true_pairs),
+            (SELECT COUNT(*) FROM true_pairs gt JOIN candidate_pairs c
+                ON c.s1_id = gt.s1_id AND c.source_id = gt.source_id),
+            (SELECT COUNT(*) FROM candidate_pairs),
+            (SELECT AVG(candidates) FROM per_s1),
+            (SELECT quantile_cont(candidates, 0.50) FROM per_s1),
+            (SELECT quantile_cont(candidates, 0.90) FROM per_s1),
+            (SELECT quantile_cont(candidates, 0.95) FROM per_s1),
+            (SELECT quantile_cont(candidates, 0.99) FROM per_s1),
+            (SELECT MAX(candidates) FROM per_s1),
+            (SELECT COUNT(*) FROM train_s1 s LEFT JOIN per_s1 p ON p.s1_id = s.entity_id
+                WHERE p.s1_id IS NULL),
+            (SELECT COUNT(*) FROM per_s1 WHERE candidates > {LARGE_CANDIDATE_SET});
+    """).fetchone()
+    total, recovered, volume, mean, median, p90, p95, p99, maximum, zero, large = metrics
+    elapsed = time.perf_counter() - started_at
+    recall = recovered / total if total else 0.0
+    result = {
+        "label": label, "total": total, "recovered": recovered, "recall": recall,
+        "volume": volume, "mean": mean or 0, "median": median or 0, "p90": p90 or 0,
+        "p95": p95 or 0, "p99": p99 or 0, "max": maximum or 0, "zero": zero,
+        "large": large, "additional": 0, "runtime": elapsed,
+    }
+    print(
+        f"  {label}: recall={recall:.4%} ({recovered:,}/{total:,}), candidates={volume:,}, "
+        f"per-S1 mean/p50/p90/p95/p99/max={result['mean']:.1f}/{result['median']:.0f}/"
+        f"{result['p90']:.0f}/{result['p95']:.0f}/{result['p99']:.0f}/{result['max']:.0f}, "
+        f"zero={zero:,}, >{LARGE_CANDIDATE_SET:,}={large:,}, runtime={elapsed:.1f}s"
+    )
+    return result
+
+
 def union_candidates(con: duckdb.DuckDBPyConnection, table: str, *inputs: str) -> str:
     con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS " + " UNION ".join(f"SELECT * FROM {item}" for item in inputs) + ";")
     return table
@@ -232,28 +320,51 @@ def run_source(con: duckdb.DuckDBPyConnection, source_name: str, source_table: s
     baseline = build_baseline_candidates(con, source_name, source_table)
     results = [measure_candidates(con, "A current four-pass baseline", baseline, prefix, started)]
 
-    create_char_index(con, "train_s1", "s1_char_index")
+    started = time.perf_counter()
     create_char_index(con, source_table, "source_char_index")
-    print_frequency_distribution(con, "source_char_index", "char-3", CHAR_FILTER_MAX_POSTINGS)
-    char_naive = build_index_candidates(con, "s1_char_index", "source_char_index", f"char_naive_{source_name}", None)
-    results.append(measure_candidates(con, "B1 char-3 naive", char_naive, prefix, started))
-    con.execute(f"DROP TABLE {char_naive};")
-    char_filtered = build_index_candidates(con, "s1_char_index", "source_char_index", f"char_filtered_{source_name}", CHAR_FILTER_MAX_POSTINGS)
+    print(f"  char index construction: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    char_frequency = create_posting_frequency(con, "source_char_index", "source_char_frequency")
+    print_frequency_distribution(con, char_frequency, "char-3", CHAR_FILTER_MAX_POSTINGS)
+    print(f"  char frequency analysis: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    results.append(measure_index_join(
+        con, "B1 char-3 naive", "s1_char_index", "source_char_index", char_frequency,
+        prefix, started, None,
+    ))
+    started = time.perf_counter()
+    char_filtered = build_index_candidates(
+        con, "s1_char_index", "source_char_index", char_frequency,
+        f"char_filtered_{source_name}", CHAR_FILTER_MAX_POSTINGS,
+    )
     results.append(measure_candidates(con, "B2 char-3 filtered", char_filtered, prefix, started))
 
-    create_number_index(con, "train_s1", "s1_number_index")
+    started = time.perf_counter()
     create_number_index(con, source_table, "source_number_index")
-    print_frequency_distribution(con, "source_number_index", "address number", NUMBER_FILTER_MAX_POSTINGS)
-    number_naive = build_index_candidates(con, "s1_number_index", "source_number_index", f"number_naive_{source_name}", None)
-    measure_candidates(con, "C1 address-number naive", number_naive, prefix, started)
-    con.execute(f"DROP TABLE {number_naive};")
-    number_filtered = build_index_candidates(con, "s1_number_index", "source_number_index", f"number_filtered_{source_name}", NUMBER_FILTER_MAX_POSTINGS)
+    print(f"  address-number index construction: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    number_frequency = create_posting_frequency(con, "source_number_index", "source_number_frequency")
+    print_frequency_distribution(con, number_frequency, "address number", NUMBER_FILTER_MAX_POSTINGS)
+    print(f"  address-number frequency analysis: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    results.append(measure_index_join(
+        con, "C1 address-number naive", "s1_number_index", "source_number_index", number_frequency,
+        prefix, started, None,
+    ))
+    started = time.perf_counter()
+    number_filtered = build_index_candidates(
+        con, "s1_number_index", "source_number_index", number_frequency,
+        f"number_filtered_{source_name}", NUMBER_FILTER_MAX_POSTINGS,
+    )
     results.append(measure_candidates(con, "C2 address-number filtered", number_filtered, prefix, started))
 
+    started = time.perf_counter()
     baseline_char = union_candidates(con, f"baseline_char_{source_name}", baseline, char_filtered)
     results.append(measure_candidates(con, "D baseline + char-3 filtered", baseline_char, prefix, started, baseline=baseline))
+    started = time.perf_counter()
     baseline_number = union_candidates(con, f"baseline_number_{source_name}", baseline, number_filtered)
     results.append(measure_candidates(con, "E baseline + address-number filtered", baseline_number, prefix, started, baseline=baseline))
+    started = time.perf_counter()
     all_strategies = union_candidates(con, f"all_strategies_{source_name}", baseline, char_filtered, number_filtered)
     results.append(measure_candidates(con, "F baseline + both filtered", all_strategies, prefix, started, baseline=baseline))
 
@@ -265,12 +376,15 @@ def run_source(con: duckdb.DuckDBPyConnection, source_name: str, source_table: s
         LEFT JOIN (SELECT DISTINCT s1_id FROM {baseline}) b ON b.s1_id = s.entity_id
         WHERE b.s1_id IS NULL;
     """)
-    recovery_char = f"recovery_char_{source_name}"
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE {recovery_char} AS
-        SELECT c.* FROM {char_filtered} c JOIN {recovery_s1} z ON z.entity_id = c.s1_id;
-    """)
-    measure_candidates(con, "char-3 recovery-only (baseline-zero S1 only)", recovery_char, prefix, started, recovery_s1, baseline)
+    started = time.perf_counter()
+    recovery_char = build_index_candidates(
+        con, "s1_char_index", "source_char_index", char_frequency,
+        f"recovery_char_{source_name}", CHAR_FILTER_MAX_POSTINGS, recovery_s1,
+    )
+    results.append(measure_candidates(
+        con, "char-3 recovery-only (baseline-zero S1 only)", recovery_char,
+        prefix, started, recovery_s1, baseline,
+    ))
 
     print(f"  Peak process memory observed: {peak_memory_mb():,.1f} MB")
     print("  Concise comparison (pre-cap):")
@@ -285,6 +399,13 @@ def run_source(con: duckdb.DuckDBPyConnection, source_name: str, source_table: s
         "  Recommendation rule: use a global additive pass only if its measured "
         "recall gain justifies its candidate-volume tail; otherwise prefer the "
         "recovery-only result for S1 entities with no baseline candidates."
+    )
+    con.execute(
+        "DROP TABLE " + ", ".join((
+            baseline, char_filtered, number_filtered, baseline_char, baseline_number,
+            all_strategies, recovery_s1, recovery_char, "source_char_index",
+            char_frequency, "source_number_index", number_frequency,
+        )) + ";"
     )
 
 
@@ -309,8 +430,15 @@ def main() -> None:
     """)
     create_ground_truth_pairs(con)
     print("--- BLOCKING STRATEGY FEASIBILITY (ALL RESULTS ARE PRE-CAP) ---")
+    started = time.perf_counter()
+    create_char_index(con, "train_s1", "s1_char_index")
+    print(f"S1 char-3 index construction: {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    create_number_index(con, "train_s1", "s1_number_index")
+    print(f"S1 address-number index construction: {time.perf_counter() - started:.1f}s")
     run_source(con, "s2", "train_s2")
     run_source(con, "s3", "train_s3")
+    con.execute("DROP TABLE s1_char_index, s1_number_index;")
 
 
 if __name__ == "__main__":
