@@ -94,6 +94,9 @@ Chunk Export: Candidate pairs are partitioned into lightweight .parquet chunks i
 
 Parallel Scoring: Worker processes compute 21 features per pair and write predicted probabilities into work/results_s2/ and work/results_s3/.
 
+Disclaimer : Once the fast_inference.py is executed sometimes an export error may occur so ignore the error and run export_submission.py to generate 
+result aka(submission.tsv) and also canmdidate_pair.tsv
+
 Step 4: Out-of-Core Output Export & Verification
 Once scoring completes, generate and validate the required submission files:
 
