@@ -40,7 +40,10 @@ def sql_path(path: Path) -> str:
 def create_ground_truth_pairs(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("""
         CREATE OR REPLACE TEMP TABLE ground_truth_pairs AS
-        SELECT source1_entity_id AS s1_id, trim(match_id) AS source_id
+        SELECT
+            source1_entity_id AS s1_id,
+            trim(match_id) AS source_entity_id,
+            trim(match_id) AS source_id
         FROM train_ground_truth,
              UNNEST(str_split(coalesce(matched_entity_ids, ''), ',')) AS matches(match_id)
         WHERE trim(match_id) <> '';
