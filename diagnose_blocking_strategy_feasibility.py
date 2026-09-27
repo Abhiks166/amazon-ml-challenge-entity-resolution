@@ -72,7 +72,8 @@ def build_baseline_candidates(con: duckdb.DuckDBPyConnection, source_name: str, 
         parts.append(bucket_pair_sql(ranked))
     table = f"baseline_{source_name}"
     con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT DISTINCT * FROM ({' UNION ALL '.join(parts)});")
-    con.execute("DROP TABLE " + ", ".join(ranked_tables) + ";")
+    for ranked_table in ranked_tables:
+        con.execute(f"DROP TABLE IF EXISTS {ranked_table};")
     return table
 
 
